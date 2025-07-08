@@ -123,12 +123,26 @@
             width: 100%;
             height: 100vh;
             background: #000;
+            overflow: hidden;
         }
 
         .camera-view {
             width: 100%;
             height: 100%;
             object-fit: cover;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        .webxr-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 10;
         }
 
         .ar-overlay {
@@ -138,6 +152,7 @@
             width: 100%;
             height: 100%;
             pointer-events: none;
+            z-index: 20;
         }
 
         .crosshair {
@@ -331,20 +346,28 @@
         <!-- Capture Page -->
         <div class="page" id="capture-page">
             <div class="capture-container">
-                <video class="camera-view" id="camera-video" autoplay playsinline></video>
+                <video class="camera-view" id="camera-video" autoplay playsinline muted></video>
+                <canvas class="webxr-canvas" id="webxr-canvas"></canvas>
                 <canvas class="ar-overlay" id="ar-overlay"></canvas>
-                <div class="crosshair"></div>
+                <div class="target-indicator" id="target-indicator"></div>
+                <div class="capture-flash" id="capture-flash"></div>
                 
                 <div class="capture-info">
-                    <div>Photos: <span id="photo-count">0</span> / 36</div>
+                    <div><strong>Photosphere Capture</strong></div>
+                    <div>Photos: <span id="photo-count">0</span> / <span id="total-points">36</span></div>
                     <div class="progress-bar">
                         <div class="progress-fill" id="progress-fill"></div>
                     </div>
-                    <div>Point at the glowing dots</div>
+                    <div id="capture-instruction">Move to align with the glowing dot</div>
+                </div>
+
+                <div class="alignment-feedback" id="alignment-feedback">
+                    <div id="alignment-text">Move device to target</div>
+                    <div id="alignment-distance">Distance: --</div>
                 </div>
                 
                 <div class="capture-controls">
-                    <button class="btn" onclick="finishCapture()">Finish Capture</button>
+                    <button class="btn" onclick="finishCapture()">Finish (<span id="captured-count">0</span>)</button>
                     <button class="btn" onclick="goHome()">Cancel</button>
                 </div>
             </div>
@@ -372,6 +395,8 @@
         </div>
     </div>
 
+    <!-- Include Three.js for 3D graphics -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <!-- Include OpenCV.js -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/opencv.js/4.8.0/opencv.js"></script>
 
@@ -382,40 +407,253 @@
         let capturedPhotos = [];
         let capturePoints = [];
         let currentTargetIndex = 0;
-        let deviceOrientation = null;
+        let deviceOrientation = { alpha: 0, beta: 0, gamma: 0 };
         let isCapturing = false;
+        let scene, camera, renderer, sphere, dots = [];
+        let lastCaptureTime = 0;
+        let alignmentThreshold = 15; // degrees
+        let autoCapture = true;
 
-        // Initialize capture points in a spherical pattern
-        function initializeCapturePoints() {
-            capturePoints = [];
-            const canvas = document.getElementById('ar-overlay');
-            const centerX = canvas.width / 2;
-            const centerY = canvas.height / 2;
-            const radius = Math.min(canvas.width, canvas.height) * 0.3;
-
-            // Create points in 3 rows (upper, middle, lower)
-            const rows = 3;
-            const pointsPerRow = [8, 12, 8]; // Fewer points at poles
+        // WebXR and 3D setup
+        function initializeWebXR() {
+            const canvas = document.getElementById('webxr-canvas');
             
-            for (let row = 0; row < rows; row++) {
-                const points = pointsPerRow[row];
-                const y = centerY + (row - 1) * radius * 0.8;
-                const currentRadius = radius * Math.cos((row - 1) * Math.PI / 4);
-                
-                for (let i = 0; i < points; i++) {
-                    const angle = (i / points) * 2 * Math.PI;
-                    const x = centerX + currentRadius * Math.cos(angle);
-                    const pointY = y;
+            // Initialize Three.js scene
+            scene = new THREE.Scene();
+            
+            // Set up camera for AR view
+            camera = new THREE.PerspectiveCamera(75, canvas.clientWidth / canvas.clientHeight, 0.1, 1000);
+            camera.position.set(0, 0, 0);
+            
+            // Set up renderer
+            renderer = new THREE.WebGLRenderer({ 
+                canvas: canvas, 
+                alpha: true, 
+                antialias: true 
+            });
+            renderer.setSize(canvas.clientWidth, canvas.clientHeight);
+            renderer.setClearColor(0x000000, 0);
+            
+            // Create transparent sphere for AR visualization
+            createARSphere();
+            
+            // Create capture points on the sphere
+            createCapturePoints();
+            
+            // Start render loop
+            animate();
+            
+            return true;
+        }
+
+        function createARSphere() {
+            const geometry = new THREE.SphereGeometry(5, 32, 16);
+            const material = new THREE.MeshBasicMaterial({
+                color: 0x007cff,
+                wireframe: true,
+                transparent: true,
+                opacity: 0.1
+            });
+            
+            sphere = new THREE.Mesh(geometry, material);
+            scene.add(sphere);
+        }
+
+        function createCapturePoints() {
+            const radius = 5;
+            capturePoints = [];
+            dots = [];
+            
+            // Create points in multiple rows for full sphere coverage
+            const rows = [
+                { elevation: 60, count: 6 },   // Top row
+                { elevation: 30, count: 8 },   // Upper row
+                { elevation: 0, count: 12 },   // Equator
+                { elevation: -30, count: 8 },  // Lower row
+                { elevation: -60, count: 6 }   // Bottom row
+            ];
+            
+            rows.forEach((row, rowIndex) => {
+                for (let i = 0; i < row.count; i++) {
+                    const azimuth = (i / row.count) * 360;
+                    const elevation = row.elevation;
                     
-                    capturePoints.push({
-                        x: x,
-                        y: pointY,
+                    // Convert spherical coordinates to Cartesian
+                    const phi = THREE.MathUtils.degToRad(90 - elevation);
+                    const theta = THREE.MathUtils.degToRad(azimuth);
+                    
+                    const x = radius * Math.sin(phi) * Math.cos(theta);
+                    const y = radius * Math.cos(phi);
+                    const z = radius * Math.sin(phi) * Math.sin(theta);
+                    
+                    const point = {
+                        position: new THREE.Vector3(x, y, z),
+                        azimuth: azimuth,
+                        elevation: elevation,
                         captured: false,
-                        azimuth: angle,
-                        elevation: (row - 1) * Math.PI / 4
+                        isTarget: false
+                    };
+                    
+                    capturePoints.push(point);
+                    
+                    // Create visual dot
+                    const dotGeometry = new THREE.SphereGeometry(0.1, 8, 6);
+                    const dotMaterial = new THREE.MeshBasicMaterial({
+                        color: 0x007cff,
+                        transparent: true,
+                        opacity: 0.8
                     });
+                    
+                    const dot = new THREE.Mesh(dotGeometry, dotMaterial);
+                    dot.position.copy(point.position);
+                    dot.userData = { pointIndex: capturePoints.length - 1 };
+                    
+                    scene.add(dot);
+                    dots.push(dot);
+                }
+            });
+            
+            // Set first point as target
+            if (capturePoints.length > 0) {
+                setTargetPoint(0);
+            }
+            
+            updateUI();
+        }
+
+        function setTargetPoint(index) {
+            // Reset all dots
+            dots.forEach((dot, i) => {
+                const point = capturePoints[i];
+                if (point.captured) {
+                    dot.material.color.setHex(0x4CAF50);
+                    dot.material.opacity = 1.0;
+                } else if (i === index) {
+                    dot.material.color.setHex(0xff6b6b);
+                    dot.material.opacity = 1.0;
+                    point.isTarget = true;
+                    
+                    // Add pulsing animation to target
+                    dot.scale.set(1.5, 1.5, 1.5);
+                } else {
+                    dot.material.color.setHex(0x007cff);
+                    dot.material.opacity = 0.6;
+                    point.isTarget = false;
+                    dot.scale.set(1, 1, 1);
+                }
+            });
+            
+            currentTargetIndex = index;
+            updateTargetInstruction();
+        }
+
+        function updateTargetInstruction() {
+            const instruction = document.getElementById('capture-instruction');
+            const remaining = capturePoints.filter(p => !p.captured).length;
+            
+            if (remaining === 0) {
+                instruction.textContent = 'All points captured! Tap Finish.';
+            } else {
+                instruction.textContent = `Align with the red dot (${remaining} remaining)`;
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            if (deviceOrientation && isCapturing) {
+                updateCameraOrientation();
+                checkAlignment();
+            }
+            
+            // Animate target dot pulsing
+            if (currentTargetIndex < dots.length && capturePoints[currentTargetIndex]) {
+                const targetDot = dots[currentTargetIndex];
+                if (!capturePoints[currentTargetIndex].captured) {
+                    const time = Date.now() * 0.005;
+                    const scale = 1.5 + Math.sin(time) * 0.3;
+                    targetDot.scale.set(scale, scale, scale);
                 }
             }
+            
+            renderer.render(scene, camera);
+        }
+
+        function updateCameraOrientation() {
+            if (!deviceOrientation) return;
+            
+            // Convert device orientation to camera rotation
+            const alpha = THREE.MathUtils.degToRad(deviceOrientation.alpha || 0);
+            const beta = THREE.MathUtils.degToRad(deviceOrientation.beta || 0);
+            const gamma = THREE.MathUtils.degToRad(deviceOrientation.gamma || 0);
+            
+            // Apply rotations to camera
+            camera.rotation.set(beta, alpha, -gamma);
+        }
+
+        function checkAlignment() {
+            if (currentTargetIndex >= capturePoints.length) return;
+            
+            const target = capturePoints[currentTargetIndex];
+            if (target.captured) {
+                findNextTarget();
+                return;
+            }
+            
+            // Calculate alignment between device orientation and target
+            const targetAzimuth = target.azimuth;
+            const targetElevation = target.elevation;
+            
+            const currentAzimuth = deviceOrientation.alpha || 0;
+            const currentElevation = (deviceOrientation.beta || 0) - 90; // Adjust for device orientation
+            
+            // Calculate angular distance
+            const azimuthDiff = Math.abs(((targetAzimuth - currentAzimuth + 180) % 360) - 180);
+            const elevationDiff = Math.abs(targetElevation - currentElevation);
+            const totalDistance = Math.sqrt(azimuthDiff * azimuthDiff + elevationDiff * elevationDiff);
+            
+            // Update alignment feedback
+            updateAlignmentFeedback(totalDistance);
+            
+            // Auto-capture if aligned and enough time has passed
+            const now = Date.now();
+            if (totalDistance < alignmentThreshold && 
+                autoCapture && 
+                (now - lastCaptureTime > 1500)) { // 1.5 second delay between captures
+                capturePhoto();
+            }
+        }
+
+        function updateAlignmentFeedback(distance) {
+            const feedback = document.getElementById('alignment-feedback');
+            const text = document.getElementById('alignment-text');
+            const distanceEl = document.getElementById('alignment-distance');
+            
+            distanceEl.textContent = `Distance: ${distance.toFixed(1)}°`;
+            
+            if (distance < alignmentThreshold) {
+                feedback.classList.add('alignment-good');
+                text.textContent = 'Perfect! Capturing...';
+            } else if (distance < alignmentThreshold * 2) {
+                feedback.classList.remove('alignment-good');
+                text.textContent = 'Almost there!';
+            } else {
+                feedback.classList.remove('alignment-good');
+                text.textContent = 'Move to target';
+            }
+        }
+
+        function findNextTarget() {
+            for (let i = 0; i < capturePoints.length; i++) {
+                if (!capturePoints[i].captured) {
+                    setTargetPoint(i);
+                    return;
+                }
+            }
+            
+            // All points captured
+            currentTargetIndex = capturePoints.length;
+            updateTargetInstruction();
         }
 
         // Page navigation
@@ -455,13 +693,15 @@
         function setupOrientationListener() {
             window.addEventListener('deviceorientation', (event) => {
                 deviceOrientation = {
-                    alpha: event.alpha,
-                    beta: event.beta,
-                    gamma: event.gamma
+                    alpha: event.alpha || 0,
+                    beta: event.beta || 0,
+                    gamma: event.gamma || 0
                 };
-                if (currentPage === 'capture-page') {
-                    checkTargetAlignment();
-                }
+            });
+            
+            // Also listen for device motion for better tracking
+            window.addEventListener('devicemotion', (event) => {
+                // Additional motion data can be used for stability
             });
         }
 
@@ -493,68 +733,47 @@
             showPage('capture-page');
             
             const video = document.getElementById('camera-video');
-            const canvas = document.getElementById('ar-overlay');
-            
             video.srcObject = stream;
             
-            // Set up canvas
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-            
-            initializeCapturePoints();
-            drawCapturePoints();
-            
-            // Start the capture loop
-            isCapturing = true;
-            updateCaptureUI();
-        }
-
-        function drawCapturePoints() {
-            const canvas = document.getElementById('ar-overlay');
-            const ctx = canvas.getContext('2d');
-            
-            // Clear canvas
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
-            // Draw capture points
-            capturePoints.forEach((point, index) => {
-                ctx.beginPath();
-                ctx.arc(point.x, point.y, 6, 0, 2 * Math.PI);
-                
-                if (point.captured) {
-                    ctx.fillStyle = '#4CAF50';
-                    ctx.strokeStyle = '#4CAF50';
-                } else if (index === currentTargetIndex) {
-                    ctx.fillStyle = '#ff6b6b';
-                    ctx.strokeStyle = '#ff6b6b';
-                } else {
-                    ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
-                    ctx.strokeStyle = '#007cff';
-                }
-                
-                ctx.fill();
-                ctx.lineWidth = 2;
-                ctx.stroke();
+            // Wait for video to load
+            await new Promise(resolve => {
+                video.addEventListener('loadedmetadata', resolve, { once: true });
             });
+            
+            // Initialize WebXR and 3D scene
+            if (initializeWebXR()) {
+                console.log('WebXR initialized successfully');
+            } else {
+                console.warn('WebXR initialization failed, using fallback');
+            }
+            
+            // Start the capture session
+            isCapturing = true;
+            updateUI();
+            
+            // Update canvas sizes
+            handleResize();
         }
 
-        function checkTargetAlignment() {
-            if (!deviceOrientation || currentTargetIndex >= capturePoints.length) return;
+        function handleResize() {
+            const canvas = document.getElementById('webxr-canvas');
+            const container = canvas.parentElement;
             
-            const target = capturePoints[currentTargetIndex];
-            const threshold = 0.2; // Alignment threshold
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight;
             
-            // Simple alignment check based on device orientation
-            const alignmentScore = Math.abs(deviceOrientation.alpha - target.azimuth * 180 / Math.PI) + 
-                                  Math.abs(deviceOrientation.beta - target.elevation * 180 / Math.PI);
-            
-            if (alignmentScore < threshold * 180) {
-                capturePhoto();
+            if (renderer) {
+                renderer.setSize(canvas.width, canvas.height);
+                camera.aspect = canvas.width / canvas.height;
+                camera.updateProjectionMatrix();
             }
         }
 
         async function capturePhoto() {
             if (!isCapturing || currentTargetIndex >= capturePoints.length) return;
+            
+            const target = capturePoints[currentTargetIndex];
+            if (target.captured) return;
             
             const video = document.getElementById('camera-video');
             const canvas = document.createElement('canvas');
@@ -564,33 +783,65 @@
             const ctx = canvas.getContext('2d');
             ctx.drawImage(video, 0, 0);
             
-            // Store the captured photo
+            // Store the captured photo with metadata
             capturedPhotos.push({
                 imageData: canvas.toDataURL('image/jpeg', 0.8),
-                point: capturePoints[currentTargetIndex],
-                timestamp: Date.now()
+                azimuth: target.azimuth,
+                elevation: target.elevation,
+                timestamp: Date.now(),
+                pointIndex: currentTargetIndex
             });
             
             // Mark point as captured
-            capturePoints[currentTargetIndex].captured = true;
+            target.captured = true;
             
-            // Move to next target
-            currentTargetIndex++;
+            // Visual feedback
+            showCaptureFlash();
+            
+            // Update the dot appearance
+            if (dots[currentTargetIndex]) {
+                const dot = dots[currentTargetIndex];
+                dot.material.color.setHex(0x4CAF50);
+                dot.scale.set(1, 1, 1);
+            }
             
             // Update UI
-            updateCaptureUI();
-            drawCapturePoints();
+            updateUI();
             
-            // Auto-finish if all points captured
-            if (currentTargetIndex >= capturePoints.length) {
-                setTimeout(finishCapture, 1000);
-            }
+            // Set timestamp for next capture delay
+            lastCaptureTime = Date.now();
+            
+            // Find next target
+            setTimeout(() => {
+                findNextTarget();
+            }, 500);
         }
 
-        function updateCaptureUI() {
-            document.getElementById('photo-count').textContent = capturedPhotos.length;
-            const progress = (capturedPhotos.length / capturePoints.length) * 100;
-            document.getElementById('progress-fill').style.width = progress + '%';
+        function showCaptureFlash() {
+            const flash = document.getElementById('capture-flash');
+            flash.classList.add('active');
+            setTimeout(() => {
+                flash.classList.remove('active');
+            }, 300);
+        }
+
+        function updateUI() {
+            const photoCount = document.getElementById('photo-count');
+            const capturedCount = document.getElementById('captured-count');
+            const totalPoints = document.getElementById('total-points');
+            const progressFill = document.getElementById('progress-fill');
+            
+            const captured = capturedPhotos.length;
+            const total = capturePoints.length;
+            
+            photoCount.textContent = captured;
+            capturedCount.textContent = captured;
+            totalPoints.textContent = total;
+            
+            const progress = total > 0 ? (captured / total) * 100 : 0;
+            progressFill.style.width = progress + '%';
+            
+            updateTargetInstruction();
         }
 
         async function finishCapture() {
@@ -684,7 +935,40 @@
             isCapturing = false;
             capturedPhotos = [];
             currentTargetIndex = 0;
+            
+            // Clean up Three.js resources
+            if (scene) {
+                while(scene.children.length > 0){ 
+                    scene.remove(scene.children[0]); 
+                }
+            }
+            if (renderer) {
+                renderer.dispose();
+            }
+            
             showPage('welcome-page');
+        }
+
+        // Initialize app
+        document.addEventListener('DOMContentLoaded', () => {
+            // Register service worker for PWA
+            if ('serviceWorker' in navigator) {
+                navigator.serviceWorker.register('data:text/javascript,console.log("PWA Service Worker")');
+            }
+            
+            // Handle orientation and resize changes
+            window.addEventListener('orientationchange', () => {
+                if (currentPage === 'capture-page') {
+                    setTimeout(handleResize, 100);
+                }
+            });
+            
+            window.addEventListener('resize', () => {
+                if (currentPage === 'capture-page') {
+                    handleResize();
+                }
+            });
+        });
         }
 
         function showErrorMessage(message) {
