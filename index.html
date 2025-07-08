@@ -222,52 +222,143 @@
         async function requestOrientation() {
             console.log('Request orientation called');
             try {
+                // Check if we're on iOS 13+ which requires permission
                 if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                    console.log('iOS device detected - requesting permission');
                     const permission = await DeviceOrientationEvent.requestPermission();
+                    console.log('Device orientation permission result:', permission);
+                    
                     if (permission === 'granted') {
                         setupOrientationListener();
                         updateStatus('orientation-status', 'Granted', 'status-granted');
                         document.getElementById('request-camera').disabled = false;
                     } else {
                         updateStatus('orientation-status', 'Denied', 'status-denied');
+                        showErrorMessage('Device orientation permission was denied. Please allow access in your browser settings.');
                     }
                 } else {
-                    setupOrientationListener();
-                    updateStatus('orientation-status', 'Granted', 'status-granted');
-                    document.getElementById('request-camera').disabled = false;
+                    // For Android and older iOS devices, try to access orientation directly
+                    console.log('Non-iOS device or older iOS - checking orientation support');
+                    
+                    // Test if orientation events are supported
+                    if (window.DeviceOrientationEvent) {
+                        // Set up a test listener to see if we get orientation data
+                        let orientationTestTimeout;
+                        let gotOrientationData = false;
+                        
+                        const testListener = (event) => {
+                            if (event.alpha !== null || event.beta !== null || event.gamma !== null) {
+                                gotOrientationData = true;
+                                window.removeEventListener('deviceorientation', testListener);
+                                clearTimeout(orientationTestTimeout);
+                                
+                                setupOrientationListener();
+                                updateStatus('orientation-status', 'Granted', 'status-granted');
+                                document.getElementById('request-camera').disabled = false;
+                                console.log('Orientation data received successfully');
+                            }
+                        };
+                        
+                        window.addEventListener('deviceorientation', testListener);
+                        
+                        // Timeout after 3 seconds if no orientation data
+                        orientationTestTimeout = setTimeout(() => {
+                            window.removeEventListener('deviceorientation', testListener);
+                            if (!gotOrientationData) {
+                                updateStatus('orientation-status', 'Not Available', 'status-denied');
+                                showErrorMessage('Device orientation is not available on this device. You can still use the app but alignment features will be limited.');
+                                // Still allow camera access
+                                document.getElementById('request-camera').disabled = false;
+                            }
+                        }, 3000);
+                        
+                        // Update status to show we're testing
+                        updateStatus('orientation-status', 'Testing...', '');
+                        
+                    } else {
+                        console.log('DeviceOrientationEvent not supported');
+                        updateStatus('orientation-status', 'Not Supported', 'status-denied');
+                        showErrorMessage('Device orientation is not supported on this device. You can still use the app but alignment features will be limited.');
+                        // Still allow camera access
+                        document.getElementById('request-camera').disabled = false;
+                    }
                 }
             } catch (error) {
                 console.error('Orientation permission error:', error);
                 updateStatus('orientation-status', 'Error', 'status-denied');
+                showErrorMessage('Error requesting orientation permission: ' + error.message);
             }
         }
 
         function setupOrientationListener() {
+            console.log('Setting up orientation listener');
             window.addEventListener('deviceorientation', (event) => {
                 deviceOrientation = {
                     alpha: event.alpha || 0,
                     beta: event.beta || 0,
                     gamma: event.gamma || 0
                 };
+                
+                // Log first few orientation readings for debugging
+                if (Math.random() < 0.01) { // Log ~1% of readings to avoid spam
+                    console.log('Orientation data:', deviceOrientation);
+                }
             });
+            
+            // Also try to listen for device motion as a fallback
+            if (window.DeviceMotionEvent) {
+                window.addEventListener('devicemotion', (event) => {
+                    // Additional motion data available if needed
+                    if (Math.random() < 0.005) { // Log ~0.5% of readings
+                        console.log('Motion data available');
+                    }
+                });
+            }
         }
 
         async function requestCamera() {
             console.log('Request camera called');
             try {
+                // First check if getUserMedia is supported
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('Camera access is not supported on this device');
+                }
+                
+                console.log('Requesting camera access...');
+                updateStatus('camera-status', 'Requesting...', '');
+                
                 stream = await navigator.mediaDevices.getUserMedia({
                     video: {
-                        facingMode: 'environment',
-                        width: { ideal: 1920 },
-                        height: { ideal: 1080 }
+                        facingMode: 'environment', // Prefer back camera
+                        width: { ideal: 1920, min: 640 },
+                        height: { ideal: 1080, min: 480 }
                     }
                 });
+                
+                console.log('Camera access granted, stream:', stream);
                 updateStatus('camera-status', 'Granted', 'status-granted');
                 document.getElementById('start-capture').disabled = false;
-                console.log('Camera access granted');
+                
+                // Test the video stream
+                const videoTracks = stream.getVideoTracks();
+                if (videoTracks.length > 0) {
+                    console.log('Video track info:', videoTracks[0].getSettings());
+                }
+                
             } catch (error) {
                 console.error('Camera permission error:', error);
                 updateStatus('camera-status', 'Denied', 'status-denied');
+                
+                // Provide specific error messages
+                if (error.name === 'NotAllowedError') {
+                    showErrorMessage('Camera access was denied. Please allow camera access in your browser settings and try again.');
+                } else if (error.name === 'NotFoundError') {
+                    showErrorMessage('No camera found on this device.');
+                } else if (error.name === 'NotReadableError') {
+                    showErrorMessage('Camera is already in use by another application.');
+                } else {
+                    showErrorMessage('Camera error: ' + error.message);
+                }
             }
         }
 
